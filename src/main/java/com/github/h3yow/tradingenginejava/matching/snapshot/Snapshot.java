@@ -14,6 +14,11 @@ import java.util.Map;
  * 快照 + lastSeq 之后的增量事件日志即可在任意空引擎上完整恢复，重复恢复不产生重复成交。
  */
 public final class Snapshot {
+    /**
+     * 快照格式版本。当前为 1；旧版本导出的 JSON 没有该字段，
+     * 反序列化后取默认值 0，恢复时按 v1 语义兼容处理（旧导出继续可用）。
+     */
+    public int formatVersion = CURRENT_FORMAT_VERSION;
     public long lastSeq;
     public long nextOrderId;
     public long nextTradeId;
@@ -23,4 +28,7 @@ public final class Snapshot {
     public Map<String, Object> trades = new LinkedHashMap<>();
     public List<Object> rejections = new ArrayList<>();
     public List<Object> orders = new ArrayList<>();
+
+    /** 当前快照格式版本号。 */
+    public static final int CURRENT_FORMAT_VERSION = 1;
 }

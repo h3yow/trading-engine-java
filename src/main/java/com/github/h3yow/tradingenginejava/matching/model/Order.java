@@ -43,6 +43,16 @@ public final class Order {
     }
 
     public long getId() { return id; }
+
+    /** 深拷贝（委托组回滚的备忘录用）：价格/总量/三分量/状态逐值复制。 */
+    public Order copy() {
+        Order c = new Order(id, seq, clientOrderId, accountId, symbol, side, type,
+                price, totalQty, status);
+        c.filledQty = this.filledQty;
+        c.canceledQty = this.canceledQty;
+        c.preReserved = this.preReserved;
+        return c;
+    }
     public long getSeq() { return seq; }
     public String getClientOrderId() { return clientOrderId; }
     public String getAccountId() { return accountId; }

@@ -28,6 +28,14 @@ public final class Account {
         this.position = position;
     }
 
+    /** 深拷贝（委托组回滚的备忘录用）：四个分量逐值复制，互不影响。 */
+    public Account copy() {
+        Account c = new Account(accountId, cash, position);
+        c.reservedCash = this.reservedCash;
+        c.reservedPosition = this.reservedPosition;
+        return c;
+    }
+
     public String getAccountId() { return accountId; }
     /** 现金总量（含冻结）。 */
     public BigDecimal getCash() { return cash; }
@@ -98,11 +106,19 @@ public final class Account {
             cash = cash.subtract(cost);
             position += qty;
         } else {
-            if (reservedPosition < qty) {
-                throw new IllegalStateException(accountId + " 卖出结算冻结持仓不足 qty=" + qty
-                        + " 冻结=" + reservedPosition);
+            if (cashWasReserved) {
+                if (reservedPosition < qty) {
+                    throw new IllegalStateException(accountId + " 卖出结算冻结持仓不足 qty=" + qty
+                            + " 冻结=" + reservedPosition);
+                }
+                reservedPosition -= qty;
+            } else {
+                // 市价卖出 taker 未预冻结：直接交割可用持仓（引擎已按可用量裁剪）
+                if (getAvailablePosition() < qty) {
+                    throw new IllegalStateException(accountId + " 卖出可用持仓不足 qty=" + qty
+                            + " 可用=" + getAvailablePosition());
+                }
             }
-            reservedPosition -= qty;
             position -= qty;
             cash = cash.add(cost);
         }

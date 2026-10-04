@@ -1,6 +1,7 @@
 package com.github.h3yow.tradingenginejava.matching.engine;
 
 import com.github.h3yow.tradingenginejava.matching.model.Account;
+import com.github.h3yow.tradingenginejava.matching.model.BatchResult;
 import com.github.h3yow.tradingenginejava.matching.model.Command;
 import com.github.h3yow.tradingenginejava.matching.model.CommandResult;
 import com.github.h3yow.tradingenginejava.matching.model.Order;
@@ -90,6 +91,20 @@ public final class MatchingEngine {
         return ordersByClientId.get(clientOrderId);
     }
 
+    /** 全部账户的只读快照视图（按账户名排序），供对账摘要/指纹核对使用。 */
+    public Map<String, Account> getAccounts() {
+        synchronized (guard) {
+            return new TreeMap<>(accounts);
+        }
+    }
+
+    /** 全部委托（含已终结）的只读列表，按委托登记顺序。 */
+    public List<Order> getOrders() {
+        synchronized (guard) {
+            return List.copyOf(ordersByClientId.values());
+        }
+    }
+
     // ---------------- 指令入口 ----------------
 
     public long getLastSeq() {
@@ -163,6 +178,135 @@ public final class MatchingEngine {
             case CANCEL -> applyCancel(c, false, -1L);
             case REPLACE -> applyReplace(c);
         };
+    }
+
+    // ---------------- 委托组原子提交 ----------------
+
+    /**
+     * 原子提交一组委托：组内严格按给定顺序（seq 必须连续）逐条撮合；
+     * 任意一条不合法则<b>整批回滚</b>——成交、委托、冻结、编号水位全部复原，
+     * 对外零残留（被回滚的 clientOrderId 可再次使用）。
+     *
+     * <p>无论成败，整批 seq 都被消耗（lastSeq 推进到批末），保证事件日志连续、
+     * 回放确定性一致：成功时每条结果与单条提交同构；回滚时触发失败的那条保留自身
+     * 拒绝原因，组内其余指令记 {@link RejectReason#BATCH_ROLLED_BACK}，
+     * 以此区分“整组没落地”与“某条本身的问题”。
+     */
+    public BatchResult applyBatch(List<Command> batch) {
+        Objects.requireNonNull(batch, "batch");
+        if (batch.isEmpty()) {
+            throw new IllegalArgumentException("委托组不能为空");
+        }
+        synchronized (guard) {
+            long startSeq = batch.get(0).getSeq();
+            for (int i = 1; i < batch.size(); i++) {
+                if (batch.get(i).getSeq() != startSeq + i) {
+                    throw new IllegalStateException(
+                            "委托组内 seq 不连续: 第 " + i + " 条 seq="
+                                    + batch.get(i).getSeq() + "，期望 " + (startSeq + i));
+                }
+            }
+            if (lastSeq == -1L) {
+                lastSeq = startSeq - 1; // 空引擎自动锚定全序起点（同 apply）
+            }
+            if (startSeq <= lastSeq) {
+                // 与 apply 的幂等语义一致：整批重复提交逐条记 DUPLICATE_COMMAND，不触碰状态
+                List<CommandResult> dup = new ArrayList<>();
+                for (Command c : batch) {
+                    Rejection r = new Rejection(c.getSeq(), c.getClientOrderId(),
+                            RejectReason.DUPLICATE_COMMAND,
+                            "委托组 seq=" + c.getSeq() + " 已应用（lastSeq=" + lastSeq + "）");
+                    rejections.add(r);
+                    dup.add(CommandResult.rejected(r));
+                }
+                return new BatchResult(startSeq, false, dup);
+            }
+            if (startSeq != lastSeq + 1) {
+                throw new IllegalStateException(
+                        "委托组起始 seq=" + startSeq + " 与水位 lastSeq=" + lastSeq + " 不连续");
+            }
+
+            StateMemento memento = saveState();
+            List<CommandResult> results = new ArrayList<>(batch.size());
+            int failAt = -1;
+            for (int i = 0; i < batch.size(); i++) {
+                CommandResult r = directApply(batch.get(i));
+                results.add(r);
+                if (!r.accepted()) {
+                    failAt = i;
+                    break; // 后续指令不再执行，整批回滚
+                }
+            }
+            lastSeq = startSeq + batch.size() - 1; // 无论成败，整批 seq 均被消耗
+
+            if (failAt < 0) {
+                return new BatchResult(startSeq, true, results);
+            }
+            restoreState(memento);
+            // 重建逐条判定：失败条保留自身原因，其余记 BATCH_ROLLED_BACK
+            List<CommandResult> rolledBack = new ArrayList<>(batch.size());
+            for (int i = 0; i < batch.size(); i++) {
+                Command c = batch.get(i);
+                Rejection r = (i == failAt)
+                        ? results.get(failAt).rejection()
+                        : new Rejection(c.getSeq(), c.getClientOrderId(),
+                                RejectReason.BATCH_ROLLED_BACK,
+                                "委托组第 " + failAt + " 条（seq="
+                                        + batch.get(failAt).getSeq() + "）不合法，整批回滚");
+                rejections.add(r);
+                rolledBack.add(CommandResult.rejected(r));
+            }
+            return new BatchResult(startSeq, false, rolledBack);
+        }
+    }
+
+    /** 状态备忘录：深拷贝账户/委托/订单簿，成交与拒绝为不可变记录仅复制列表。 */
+    private StateMemento saveState() {
+        StateMemento m = new StateMemento();
+        m.nextOrderId = nextOrderId;
+        m.nextTradeId = nextTradeId;
+        m.accounts = new TreeMap<>();
+        accounts.forEach((id, a) -> m.accounts.put(id, a.copy()));
+        m.orders = new LinkedHashMap<>();
+        ordersByClientId.forEach((coid, o) -> m.orders.put(coid, o.copy()));
+        Map<Long, Order> byId = new LinkedHashMap<>();
+        m.orders.values().forEach(o -> byId.put(o.getId(), o));
+        m.books = new TreeMap<>();
+        books.forEach((symbol, book) -> {
+            OrderBook copy = new OrderBook(symbol);
+            for (Order live : book.liveOrdersInBookOrder()) {
+                copy.add(byId.get(live.getId()));
+            }
+            m.books.put(symbol, copy);
+        });
+        m.trades = new ArrayList<>(trades);
+        m.rejections = new ArrayList<>(rejections);
+        return m;
+    }
+
+    private void restoreState(StateMemento m) {
+        nextOrderId = m.nextOrderId;
+        nextTradeId = m.nextTradeId;
+        accounts.clear();
+        accounts.putAll(m.accounts);
+        ordersByClientId.clear();
+        ordersByClientId.putAll(m.orders);
+        books.clear();
+        books.putAll(m.books);
+        trades.clear();
+        trades.addAll(m.trades);
+        rejections.clear();
+        rejections.addAll(m.rejections);
+    }
+
+    private static final class StateMemento {
+        long nextOrderId;
+        long nextTradeId;
+        Map<String, Account> accounts;
+        Map<String, Order> orders;
+        Map<String, OrderBook> books;
+        List<Trade> trades;
+        List<Rejection> rejections;
     }
 
     private CommandResult reject(Rejection r) {
@@ -492,6 +636,18 @@ public final class MatchingEngine {
 
     // ---------------- 快照 ----------------
 
+    /**
+     * 不停机一致性快照。
+     *
+     * <p><b>一致性切点：</b>全部状态变更都在 {@code guard} 内、以整条指令为粒度完成，
+     * 因此快照要么落在第 k 条指令<b>之后</b>、第 k+1 条<b>之前</b>，绝不夹在指令中间；
+     * 导出内容里的 {@code lastSeq} 就是这个明确切点。其他账户的并发提交仅在
+     * 内存深拷贝期间被短暂阻塞（不覆盖 JSON 序列化），拷贝完成后写入立即继续。
+     *
+     * <p><b>续跑等价：</b>快照 + lastSeq 之后的增量日志在任意空引擎上恢复续跑，
+     * 最终成交序列、每笔委托三分量（已成交/已撤销/剩余）与账户四分量，
+     * 与全程未导出的实例逐项一致。
+     */
     public Snapshot snapshot() {
     synchronized (guard) {
         Snapshot s = new Snapshot();
@@ -564,11 +720,33 @@ public final class MatchingEngine {
             m.put("price", o.getPrice() == null ? null : o.getPrice().toPlainString());
             m.put("totalQty", o.getTotalQty());
             m.put("filledQty", o.getFilledQty());
+            m.put("canceledQty", o.getCanceledQty());
             m.put("status", o.getStatus().name());
             os.add(m);
         }
         s.orders = os;
         return s;
+        }
+    }
+
+    /**
+     * 导出快照并序列化为 JSON。内存深拷贝在 {@code guard} 内完成（确定切点），
+     * JSON 序列化在锁外进行——写入线程最多被阻塞一次内存拷贝的时长，
+     * 序列化耗时（通常远大于拷贝）完全不阻塞撮合。
+     */
+    public String snapshotJson() {
+        return com.github.h3yow.tradingenginejava.matching.util.JsonIO.toJson(snapshot());
+    }
+
+    /**
+     * 盘后对账摘要：在 {@code guard} 内取数，落在明确的指令切点（lastSeq）上。
+     * 同一状态两次取摘要逐字节相同；两台实例摘要一致即状态一致，
+     * 不一致时可用 {@code ReconciliationDigest.diff} 定位到账户/标的/维度。
+     */
+    public com.github.h3yow.tradingenginejava.matching.digest.ReconciliationDigest reconciliationDigest() {
+        synchronized (guard) {
+            return com.github.h3yow.tradingenginejava.matching.digest.ReconciliationDigest
+                    .build(lastSeq, accounts, ordersByClientId.values(), trades);
         }
     }
 
@@ -604,13 +782,37 @@ public final class MatchingEngine {
 
         for (Order o : restoreOrders(s)) {
             ordersByClientId.put(o.getClientOrderId(), o);
-            if (o.isLive() && o.getType() == OrderType.LIMIT) {
-                books.computeIfAbsent(o.getSymbol(), OrderBook::new).add(o);
-            }
         }
 
+        // 按快照中订单簿的精确排队顺序重建：改单会把委托移到价位队尾，
+        // 若按委托登记顺序重建会改变价位内 FIFO，导致续撮成交序列偏离。
+        // symbolBooks 记录了 bids 降序/asks 升序、价位内 FIFO 的真实顺序，据此逐笔挂回。
         for (Map.Entry<String, Object> e : s.symbolBooks.entrySet()) {
-            books.computeIfAbsent(e.getKey(), OrderBook::new);
+            OrderBook book = books.computeIfAbsent(e.getKey(), OrderBook::new);
+            if (!(e.getValue() instanceof Map<?, ?> bookMap)) {
+                continue;
+            }
+            for (String sideKey : List.of("bids", "asks")) {
+                if (((Map<?, ?>) bookMap).get(sideKey) instanceof List<?> levels) {
+                    for (Object lvl : levels) {
+                        if (!(lvl instanceof Map<?, ?> level)) {
+                            continue;
+                        }
+                        if (((Map<?, ?>) level).get("orders") instanceof List<?> orderList) {
+                            for (Object om : orderList) {
+                                if (!(om instanceof Map<?, ?> om2)) {
+                                    continue;
+                                }
+                                Order o = ordersByClientId.get(
+                                        (String) ((Map<?, ?>) om2).get("clientOrderId"));
+                                if (o != null && o.isLive() && o.getType() == OrderType.LIMIT) {
+                                    book.add(o);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         restoreTrades(s);

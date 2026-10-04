@@ -147,6 +147,29 @@ final class OrderBook {
         return bids.isEmpty() && asks.isEmpty();
     }
 
+    /**
+     * 按簿内顺序导出全部 live 委托（买盘价格降序、卖盘升序，价位内 FIFO）。
+     * 委托组回滚备忘录据此重建订单簿，保证价位内排队顺序逐位一致。
+     */
+    List<Order> liveOrdersInBookOrder() {
+        List<Order> out = new ArrayList<>();
+        for (List<Order> level : bids.descendingMap().values()) {
+            for (Order o : level) {
+                if (o.isLive()) {
+                    out.add(o);
+                }
+            }
+        }
+        for (List<Order> level : asks.values()) {
+            for (Order o : level) {
+                if (o.isLive()) {
+                    out.add(o);
+                }
+            }
+        }
+        return out;
+    }
+
     /** 当前在簿 live 委托数（风控用）。 */
     int liveOrderCount(String accountId) {
         int n = 0;
