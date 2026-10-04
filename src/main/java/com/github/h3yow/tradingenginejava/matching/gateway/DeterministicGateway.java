@@ -1,6 +1,7 @@
 package com.github.h3yow.tradingenginejava.matching.gateway;
 
 import com.github.h3yow.tradingenginejava.matching.engine.MatchingEngine;
+import com.github.h3yow.tradingenginejava.matching.model.BatchResult;
 import com.github.h3yow.tradingenginejava.matching.model.Command;
 import com.github.h3yow.tradingenginejava.matching.model.CommandResult;
 import com.github.h3yow.tradingenginejava.matching.model.RejectReason;
@@ -146,5 +147,16 @@ public final class DeterministicGateway {
     /** 顺序派发（不打乱），仍走多线程并发提交。 */
     public Map<Long, CommandResult> submitBatch(Collection<Command> batch) {
         return submitBatch(batch, null);
+    }
+
+    /**
+     * 原子提交一个委托组：组内按既定顺序依次撮合，任意一条不合法则整组回滚。
+     *
+     * <p>组内指令整体进入唯一撮合消费者线程执行，期间不会插入其他批次的指令，
+     * 因此“原子性”对并发提交的其他账户同样成立；返回的 {@link BatchResult} 可区分
+     * 整组被拒（{@code batchRejection}）与组内某条自身被拒（{@code memberRejection}）。
+     */
+    public BatchResult submitAtomicBatch(Collection<Command> group) {
+        return engine.applyAtomicBatch(new ArrayList<>(group));
     }
 }

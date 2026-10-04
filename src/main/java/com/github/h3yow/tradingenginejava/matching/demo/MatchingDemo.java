@@ -3,11 +3,15 @@ package com.github.h3yow.tradingenginejava.matching.demo;
 import com.github.h3yow.tradingenginejava.matching.engine.MatchingEngine;
 import com.github.h3yow.tradingenginejava.matching.engine.RiskConfig;
 import com.github.h3yow.tradingenginejava.matching.gateway.DeterministicGateway;
+import com.github.h3yow.tradingenginejava.matching.gateway.StreamingGateway;
+import com.github.h3yow.tradingenginejava.matching.model.BatchResult;
 import com.github.h3yow.tradingenginejava.matching.model.Command;
 import com.github.h3yow.tradingenginejava.matching.model.CommandResult;
 import com.github.h3yow.tradingenginejava.matching.model.Side;
-import com.github.h3yow.tradingenginejava.matching.replay.ReplaySupport;
+import com.github.h3yow.tradingenginejava.matching.reconcile.Mismatch;
+import com.github.h3yow.tradingenginejava.matching.reconcile.Reconciler;
 import com.github.h3yow.tradingenginejava.matching.snapshot.Snapshot;
+import com.github.h3yow.tradingenginejava.matching.snapshot.SnapshotExport;
 import com.github.h3yow.tradingenginejava.matching.util.JsonIO;
 
 import java.math.BigDecimal;
@@ -82,33 +86,81 @@ public final class MatchingDemo {
         cr.values().forEach(r -> System.out.println("判定: " + r));
         printBalances(engine);
 
-        System.out.println("========== 阶段三：快照导出/JSON ==========");
-        Snapshot snapshot = engine.snapshot();
-        String json = JsonIO.toJson(snapshot);
-        System.out.println("快照 lastSeq=" + snapshot.lastSeq
-                + " 成交数=" + engine.getTrades().size() + " JSON字节=" + json.length());
+        System.out.println("========== 阶段三：委托组原子提交（成功 + 整组回滚对比） ==========");
+        // 成功组：Dana 买2@99 成交，再挂买1@90（两条各自的撮合结果都可单独查）
+        List<Command> goodGroup = List.of(
+                Command.placeLimit(++s, "Dana", "BTC", "D-g1",
+                        Side.BUY, new BigDecimal("99"), 2),
+                Command.placeLimit(++s, "Dana", "BTC", "D-g2",
+                        Side.BUY, new BigDecimal("90"), 1));
+        BatchResult good = engine.applyAtomicBatch(goodGroup);
+        System.out.println("成功组 committed=" + good.committed()
+                + "，逐单结果数=" + good.results().size() + "：");
+        good.results().forEach(r -> System.out.println("  判定: " + r));
 
-        System.out.println("========== 阶段四：空引擎从快照恢复 + 整段日志重复回放 ==========");
-        MatchingEngine rebuilt = new MatchingEngine();
-        rebuilt.restore(JsonIO.fromJson(json, Snapshot.class));
-        List<CommandResult> applied = ReplaySupport.replay(rebuilt,
-                concat(phase1, phase2));
-        System.out.println("历史指令被跳过数=" + (phase1.size() + phase2.size() - applied.size())
-                + "，新增应用=" + applied.size());
-        ReplaySupport.replay(rebuilt, concat(phase1, phase2));
-        System.out.println("再次回放后成交数仍为=" + rebuilt.getTrades().size()
-                + "（原引擎=" + engine.getTrades().size() + "）");
-        printBalances(rebuilt);
+        // 回滚组：第1条会成交，第2条 Carol 现金不足 -> 整组回滚、零残留
+        long rollbackStart = s + 1;
+        List<Command> badGroup = List.of(
+                Command.placeLimit(rollbackStart, "Dana", "BTC", "D-bad1",
+                        Side.BUY, new BigDecimal("99"), 1),
+                Command.placeLimit(rollbackStart + 1, "Carol", "BTC", "D-bad2",
+                        Side.BUY, new BigDecimal("99"), 1000));
+        BatchResult bad = engine.applyAtomicBatch(badGroup);
+        System.out.println("回滚组 committed=" + bad.committed()
+                + "，批次级原因=" + bad.batchRejection()
+                + "，成员原因=" + (bad.memberRejection() == null ? "-"
+                : bad.memberRejection().reason())
+                + "，水位仍=" + engine.getLastSeq()
+                + "，D-bad1 残留=" + (engine.getOrder("D-bad1") != null));
 
-        System.out.println("========== 结论：两次引擎成交数/拒绝数一致，余额一致，可复现 ==========");
+        System.out.println("========== 阶段四：不停机一致性快照（边写边导） ==========");
+        MatchingEngine continued;
+        SnapshotExport onlineExport;
+        try (StreamingGateway gw = new StreamingGateway(engine)) {
+            gw.prime(engine.getLastSeq() + 1);
+            // 持续写入 3 条（成交 + 撤单），全部落地后在写入流中立即导出；
+            // 导出请求与写入走同一条全序队列，屏障点恰好是这 3 条之后的指令边界
+            List<Command> phase4 = List.of(
+                    Command.placeLimit(++s, "Bob", "BTC", "B-sell-4",
+                            Side.SELL, new BigDecimal("90"), 2),
+                    Command.placeLimit(++s, "Alice", "BTC", "A-buy-4",
+                            Side.BUY, new BigDecimal("90"), 1),
+                    Command.cancel(++s, "Dana", "D-g2"));
+            phase4.forEach(c -> System.out.println("写入中: " + c));
+            phase4.forEach(c -> gw.submit(c).join());
+            onlineExport = gw.exportSnapshot();
+            System.out.println("快照边界 lastSeq=" + onlineExport.lastSeq()
+                    + "（写入不停机，JSON 字节=" + onlineExport.json().length()
+                    + "，采集耗时微秒=" + onlineExport.captureNanos() / 1000 + "）");
+        }
+
+        System.out.println("========== 阶段五：从在线快照恢复 + 增量回放，与原引擎对账 ==========");
+        continued = new MatchingEngine();
+        continued.restore(JsonIO.fromJson(onlineExport.json(), Snapshot.class));
+        // 阶段五在新实例上再续跑新指令（继续撮合 + 撤改）
+        List<Command> phase5 = List.of(
+                Command.placeLimit(++s, "Bob", "ETH", "B-ETH-s",
+                        Side.SELL, new BigDecimal("10"), 5),
+                Command.placeLimit(++s, "Alice", "ETH", "A-ETH-b",
+                        Side.BUY, new BigDecimal("10"), 5),
+                Command.replace(++s, "Bob", "B-ETH-s", new BigDecimal("11"), 5));
+        phase5.forEach(continued::apply);
+        // 原引擎执行完全相同的后续指令，用于对账
+        phase5.forEach(engine::apply);
+
+        List<Mismatch> mismatches = Reconciler.compare(engine, continued);
+        String summaryJson = JsonIO.toJson(Reconciler.summarize(continued));
+        String summaryAgain = JsonIO.toJson(Reconciler.summarize(continued));
+        System.out.println("对账差异数=" + mismatches.size()
+                + "（0=两实例状态一致），摘要可复现=" + summaryJson.equals(summaryAgain));
+        mismatches.forEach(m -> System.out.println("  差异: " + m));
+        printBalances(engine);
+
+        System.out.println("========== 结论：成交数/拒绝数一致，余额一致，对账无差异 ==========");
         System.out.println("trades: " + engine.getTrades().size()
-                + " == " + rebuilt.getTrades().size());
+                + " == " + continued.getTrades().size());
         System.out.println("rejects: " + engine.getRejections().size()
-                + " == " + rebuilt.getRejections().size());
-    }
-
-    private static List<Command> concat(List<Command> a, List<Command> b) {
-        return java.util.stream.Stream.concat(a.stream(), b.stream()).toList();
+                + " == " + continued.getRejections().size());
     }
 
     private static void printBalances(MatchingEngine e) {

@@ -1,8 +1,10 @@
 package com.github.h3yow.tradingenginejava.matching.engine;
 
 import com.github.h3yow.tradingenginejava.matching.model.Account;
+import com.github.h3yow.tradingenginejava.matching.model.BatchResult;
 import com.github.h3yow.tradingenginejava.matching.model.Command;
 import com.github.h3yow.tradingenginejava.matching.model.CommandResult;
+import com.github.h3yow.tradingenginejava.matching.model.CommandType;
 import com.github.h3yow.tradingenginejava.matching.model.Order;
 import com.github.h3yow.tradingenginejava.matching.model.OrderStatus;
 import com.github.h3yow.tradingenginejava.matching.model.OrderType;
@@ -165,6 +167,113 @@ public final class MatchingEngine {
         };
     }
 
+    // ---------------- 委托组原子提交 ----------------
+
+    /**
+     * 原子提交一组委托。
+     *
+     * <p><b>语义：</b>组内指令严格按既定顺序（seq 升序）依次撮合；只要有任意一条不合法，
+     * 整组回滚到提交前检查点——不残留成交、不残留挂单与冻结、不残留拒绝记录、不推进水位与
+     * 编号水位，如同整组从未到达；全部成功时组内每条指令各自的 {@link CommandResult}
+     * 仍可单独查询。
+     *
+     * <p><b>两种拒绝可区分：</b>
+     * <ul>
+     *   <li>批次本身不合法（空批次、seq 不连续/重复、与引擎水位不衔接、组内 PLACE 的
+     *       clientOrderId 互相重复）→ {@code batchRejection}，原因固定为
+     *       {@link RejectReason#BATCH_REJECTED}，整组未触碰引擎状态；</li>
+     *   <li>组内某条指令自身被风控/业务规则拒绝 → {@code memberRejection} 给出该条的原始
+     *       拒绝原因（资金不足、自成交等），整组同样回滚零生效。</li>
+     * </ul>
+     */
+    public BatchResult applyAtomicBatch(List<Command> batch) {
+        Objects.requireNonNull(batch, "batch");
+        synchronized (guard) {
+            if (batch.isEmpty()) {
+                return BatchResult.rolledBack(-1L,
+                        new Rejection(-1L, null, RejectReason.BATCH_REJECTED,
+                                "委托组为空"), null);
+            }
+            List<Command> ordered = new ArrayList<>(batch);
+            ordered.sort(java.util.Comparator.comparingLong(Command::getSeq));
+            long firstSeq = ordered.get(0).getSeq();
+
+            // seq 必须严格连续递增（同组重复 seq / 跳号均为批次级非法）
+            for (int i = 1; i < ordered.size(); i++) {
+                if (ordered.get(i).getSeq() != ordered.get(i - 1).getSeq() + 1) {
+                    return BatchResult.rolledBack(firstSeq,
+                            new Rejection(firstSeq, null, RejectReason.BATCH_REJECTED,
+                                    "委托组 seq 不连续或存在重复: "
+                                            + ordered.get(i - 1).getSeq() + " -> "
+                                            + ordered.get(i).getSeq()),
+                            null);
+                }
+            }
+            // 必须与引擎水位严丝合缝衔接（空引擎以首条 seq 锚定起点，与单条 apply 一致）
+            long baseWatermark = lastSeq;
+            if (lastSeq == -1L) {
+                baseWatermark = firstSeq - 1;
+            }
+            if (firstSeq != baseWatermark + 1) {
+                return BatchResult.rolledBack(firstSeq,
+                        new Rejection(firstSeq, null, RejectReason.BATCH_REJECTED,
+                                "委托组起点 seq=" + firstSeq + " 与引擎水位 lastSeq="
+                                        + lastSeq + " 不衔接"),
+                        null);
+            }
+            // 组内 PLACE 的 clientOrderId 不得互相重复
+            java.util.Set<String> idsInBatch = new java.util.HashSet<>();
+            for (Command c : ordered) {
+                if (c.getType() == CommandType.PLACE
+                        && !idsInBatch.add(c.getClientOrderId())) {
+                    return BatchResult.rolledBack(firstSeq,
+                            new Rejection(c.getSeq(), c.getClientOrderId(),
+                                    RejectReason.BATCH_REJECTED,
+                                    "委托组内 clientOrderId 重复: " + c.getClientOrderId()),
+                            null);
+                }
+            }
+
+            // 提交前检查点：任何一条被拒（或异常）都整体还原，保证零中间状态
+            Snapshot checkpoint = snapshot();
+            long startLastSeq = lastSeq;
+            long cursor = baseWatermark;
+            List<CommandResult> results = new ArrayList<>(ordered.size());
+            try {
+                for (Command c : ordered) {
+                    cursor = c.getSeq();
+                    CommandResult r = directApply(c);
+                    if (!r.accepted()) {
+                        restore(checkpoint);
+                        return BatchResult.rolledBack(firstSeq, null, r.rejection());
+                    }
+                    results.add(r);
+                }
+                lastSeq = cursor;
+                return BatchResult.committed(firstSeq, results);
+            } catch (RuntimeException ex) {
+                // 防御性回滚：异常时也绝不允许一半生效的中间状态外泄
+                restore(checkpoint);
+                lastSeq = startLastSeq;
+                throw ex;
+            }
+        }
+    }
+
+    /** 全部账户 ID（按 ID 升序），供盘后对账使用。 */
+    public java.util.Set<String> accountIds() {
+        synchronized (guard) {
+            return java.util.Set.copyOf(accounts.keySet());
+        }
+    }
+
+    /** 全部委托（含已终结，按下单顺序），供盘后对账使用。 */
+    public List<Order> getAllOrders() {
+        synchronized (guard) {
+            return List.copyOf(ordersByClientId.values());
+        }
+    }
+
     private CommandResult reject(Rejection r) {
         rejections.add(r);
         return CommandResult.rejected(r);
@@ -321,6 +430,7 @@ public final class MatchingEngine {
                     break scan; // 一个都买不起，更贵价位更无可能
                 }
                 qty = Math.min(qty, affordable);
+                // taker 买 -> maker 为挂簿卖方，其资金来源是冻结持仓
                 if (makerAcct.getReservedPosition() < qty) {
                     continue;
                 }
@@ -336,6 +446,7 @@ public final class MatchingEngine {
                     break scan;
                 }
                 BigDecimal cost = makerPrice.multiply(BigDecimal.valueOf(qty));
+                // taker 卖 -> maker 为挂簿买方，其资金来源是冻结现金
                 if (makerAcct.getReservedCash().compareTo(cost) < 0) {
                     // 理论上买方挂单已冻结对应现金，此处仅为防御
                     continue;
@@ -564,6 +675,7 @@ public final class MatchingEngine {
             m.put("price", o.getPrice() == null ? null : o.getPrice().toPlainString());
             m.put("totalQty", o.getTotalQty());
             m.put("filledQty", o.getFilledQty());
+            m.put("canceledQty", o.getCanceledQty());
             m.put("status", o.getStatus().name());
             os.add(m);
         }

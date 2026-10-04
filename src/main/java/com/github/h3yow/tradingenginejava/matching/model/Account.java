@@ -80,11 +80,14 @@ public final class Account {
      * @param side  本账户在该笔成交中的方向
      * @param qty   成交量
      * @param cost  成交金额（price*qty，由引擎计算以避免重复）
-     * @param cashWasReserved 该笔买入是否来自已冻结的挂单资金（taker 市价买入为 false，需即时扣可用）
+     * @param wasReserved 该笔交割是否来自<b>已冻结</b>额度：
+     *                    挂簿单成交（含改单重建单）传 true，从冻结现金/冻结持仓中扣减；
+     *                    新到达即成交的市价/穿价限价单传 false，买方从可用现金扣、
+     *                    卖方直接交割可用持仓（可用与总量同步减少，不动冻结分量）
      */
-    public void settle(Side side, long qty, BigDecimal cost, boolean cashWasReserved) {
+    public void settle(Side side, long qty, BigDecimal cost, boolean wasReserved) {
         if (side == Side.BUY) {
-            if (cashWasReserved) {
+            if (wasReserved) {
                 if (reservedCash.compareTo(cost) < 0) {
                     throw new IllegalStateException(accountId + " 买入结算冻结现金不足 cost=" + cost);
                 }
@@ -98,11 +101,19 @@ public final class Account {
             cash = cash.subtract(cost);
             position += qty;
         } else {
-            if (reservedPosition < qty) {
-                throw new IllegalStateException(accountId + " 卖出结算冻结持仓不足 qty=" + qty
-                        + " 冻结=" + reservedPosition);
+            if (wasReserved) {
+                if (reservedPosition < qty) {
+                    throw new IllegalStateException(accountId + " 卖出结算冻结持仓不足 qty=" + qty
+                            + " 冻结=" + reservedPosition);
+                }
+                reservedPosition -= qty;
+            } else {
+                // 新到达即成交的卖方（市价卖 / 穿价限价卖）：从可用持仓直接交割，不得超卖
+                if (getAvailablePosition() < qty) {
+                    throw new IllegalStateException(accountId + " 卖出可用持仓不足 qty=" + qty
+                            + " 可用=" + getAvailablePosition());
+                }
             }
-            reservedPosition -= qty;
             position -= qty;
             cash = cash.add(cost);
         }

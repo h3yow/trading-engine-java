@@ -21,5 +21,7 @@ public enum RejectReason {
     /** 幂等键冲突：同一 clientOrderId 或同一指令序号重复提交。 */
     DUPLICATE_COMMAND,
     /** 指令本身不合法（未知类型、缺少字段等）。 */
-    INVALID_COMMAND
+    INVALID_COMMAND,
+    /** 委托组原子提交失败：批次级校验未过或组内某条被拒，整组回滚、零生效。 */
+    BATCH_REJECTED
 }
